@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dynamic Tug Scheduling — Project A Demo</title>
+<title>Dynamic Tug Scheduling — Project A Demo · V_4_0</title>
 <style>
   :root{
     --ink:#0C2A38;--ink2:#081E28;--panel:#12303d;--panel2:#0f2a36;
@@ -344,7 +344,9 @@ const WHARF_X = 884;
 const BERTHS_Y = [120, 270, 420];
 const BERTH_SHIP_X = 820;
 const QUEUE = (()=>{ const q=[]; for(const x of [190,120,50]) for(const y of [90,180,270,360,450]) q.push([x,y]); return q; })();
-const TUG_BASE = [430, 500];
+const TUG_BASE = [430, 48];   // parked along the top, clear of the bottom departure lane
+const NUM_TUGS = 7;         // fleet size
+const TUGS_PER_MOVE = 2;    // tugs required to move a ship in or out
 const SPAWN = [40, 60];
 let selectedShipId = null;   // ship inspected via click
 const RELEASE_X = 600, OUT_Y = 512;   // outbound: tug releases here; ships then depart left along OUT_Y
@@ -373,8 +375,10 @@ function resetStats(){ RULES.forEach(r=> stats[r]={served:0,sumWait:0,onTime:0,b
 function init(spawnInitial=true){
   ships=[]; tugs=[]; berths=[]; simTime=0; shipSeq=0; lastDecision=-999; gust=0;
   berths = BERTHS_Y.map((y,i)=>({id:'B'+(i+1), x:BERTH_SHIP_X, y, rate:[2.2,2.7,3.2][i], ship:null}));
-  tugs = [[TUG_BASE[0]-70,TUG_BASE[1]],[TUG_BASE[0],TUG_BASE[1]],[TUG_BASE[0]+70,TUG_BASE[1]]]
-        .map((p,i)=>({id:'T'+(i+1), x:p[0], y:p[1], hx:p[0], hy:p[1], state:'idle', ship:null, broken:0, trail:[], angle:-Math.PI/2}));
+  tugs = Array.from({length:NUM_TUGS}, (_,i)=>{
+    const x = TUG_BASE[0] + (i - (NUM_TUGS-1)/2) * 52, y = TUG_BASE[1];
+    return {id:'T'+(i+1), x, y, hx:x, hy:y, state:'idle', ship:null, broken:0, trail:[], angle:-Math.PI/2};
+  });
   resetStats();
   for(let i=0;i<3;i++) if(spawnInitial) spawnShip(true);
 }
@@ -385,7 +389,7 @@ function spawnShip(initial, urgentArg){
   const s={
     id:'S'+(++shipSeq), num:shipSeq, teu, urgent,
     x: SPAWN[0], y: SPAWN[1]+Math.random()*30,
-    state:'incoming', slot:-1, berth:null, tug:null,
+    state:'incoming', slot:-1, berth:null, tugs:[],
     arrival: simTime, berthStart:null,
     deadline: simTime + (urgent?14:26) + Math.random()*(urgent?12:30),
     moves: Math.max(4, Math.round(teu/22)), done:0
@@ -410,6 +414,21 @@ function buildState(){
 
 function dist(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
 
+// choose which physical tugs to dispatch:
+//   nearest rule -> the n closest free tugs;   every other rule -> n tugs at random.
+function selectTugs(candidates, sx, sy, n, ruleName){
+  const poolT=[...candidates];
+  if(ruleName==='nearest'){
+    poolT.sort((a,b)=> dist(a.x,a.y,sx,sy) - dist(b.x,b.y,sx,sy));
+    return poolT.slice(0,n);
+  }
+  const out=[];
+  for(let i=0;i<n && poolT.length;i++) out.push(poolT.splice(Math.floor(Math.random()*poolT.length),1)[0]);
+  return out;
+}
+function shipTugs(s){ return ((s&&s.tugs)||[]).map(id=>tugs.find(t=>t.id===id)).filter(Boolean); }
+function tugLateral(i,n){ return n>1 ? (i - (n-1)/2)*24 : 0; }   // even lateral spread across the convoy
+
 // each scheduler returns { assignments:[{ship,berth,tug}], reason }
 function schedule(state, ruleName){
   const shipObjs = state.waitingShips.map(w=>({...w, ref:ships.find(s=>s.id===w.id)}));
@@ -418,12 +437,12 @@ function schedule(state, ruleName){
   const assigns=[]; let reason='';
   const pool = [...shipObjs];
 
-  while(pool.length && freeTugs.length && freeBerths.length){
-    // score each candidate ship using its nearest free tug
+  while(pool.length && freeTugs.length >= TUGS_PER_MOVE && freeBerths.length){
+    // score each candidate ship using its nearest free tug (ship prioritisation only)
     let best=null;
     for(const s of pool){
-      let nt=null, nd=Infinity;
-      for(const t of freeTugs){ const d=dist(t.x,t.y,s.ref.x,s.ref.y); if(d<nd){nd=d;nt=t;} }
+      let nd=Infinity;
+      for(const t of freeTugs){ const d=dist(t.x,t.y,s.ref.x,s.ref.y); if(d<nd){nd=d;} }
       let sc;
       if(ruleName==='fcfs')      sc = -s.ref.arrival;            // strict first-come (earliest arrival wins)
       else if(ruleName==='edd')  sc = -s.ref.deadline;           // strict earliest-due-date
@@ -436,15 +455,17 @@ function schedule(state, ruleName){
         const trav = Math.exp(-nd/(GP.kt*GP.travelbar));         // throughput: favour tugs that are close
         sc = (w/p) * due * trav;
       }
-      if(!best || sc>best.sc){ best={s, tug:nt, nd, sc}; }
+      if(!best || sc>best.sc){ best={s, nd, sc}; }
     }
     // give this ship the free berth closest to it — short, mostly-horizontal tows, fewer crossings
     const sx=best.s.ref.x, sy=best.s.ref.y;
     const bb = freeBerths.reduce((a,b)=> dist(sx,sy,b.x,b.y) < dist(sx,sy,a.x,a.y) ? b : a, freeBerths[0]);
-    assigns.push({ship:best.s.id, berth:bb.id, tug:best.tug.id, score:+best.sc.toFixed(1)});
+    // pick the tugs to move this ship in: nearest TUGS_PER_MOVE for "nearest", otherwise at random
+    const chosen = selectTugs(freeTugs, sx, sy, TUGS_PER_MOVE, ruleName);
+    assigns.push({ship:best.s.id, berth:bb.id, tugs:chosen.map(t=>t.id), score:+best.sc.toFixed(1)});
     // remove used
     pool.splice(pool.findIndex(p=>p.id===best.s.id),1);
-    freeTugs.splice(freeTugs.findIndex(t=>t.id===best.tug.id),1);
+    chosen.forEach(ct=> freeTugs.splice(freeTugs.findIndex(t=>t.id===ct.id),1));
     freeBerths.splice(freeBerths.findIndex(b=>b.id===bb.id),1);
   }
   reason = assigns.length? ('picked '+assigns.length+' by '+ruleName) : 'no feasible pairing';
@@ -453,10 +474,12 @@ function schedule(state, ruleName){
 
 function applyAssignments(res){
   for(const a of res.assignments){
-    const s=ships.find(x=>x.id===a.ship), b=berths.find(x=>x.id===a.berth), t=tugs.find(x=>x.id===a.tug);
-    if(!s||!b||!t) continue;
-    s.state='assigned'; s.berth=b.id; s.tug=t.id;
-    b.ship=s.id; t.state='to_ship'; t.ship=s.id;
+    const s=ships.find(x=>x.id===a.ship), b=berths.find(x=>x.id===a.berth);
+    const ts=(a.tugs||[]).map(id=>tugs.find(x=>x.id===id)).filter(Boolean);
+    if(!s||!b||ts.length<TUGS_PER_MOVE) continue;
+    s.state='assigned'; s.berth=b.id; s.tugs=ts.map(t=>t.id);
+    b.ship=s.id;
+    ts.forEach(t=>{ t.state='to_ship'; t.ship=s.id; });
   }
 }
 
@@ -504,10 +527,12 @@ function tugMove(t, tx, ty, sp, dt){
 // dispatch a free tug to unberth any ship that has finished offloading
 function assignOutbound(){
   for(const s of ships){ if(s.state!=='await_out') continue;
-    let bt=null, bd=Infinity;
-    for(const t of tugs){ if(t.state==='idle' && !t.broken){ const dd=dist(t.x,t.y,s.x,s.y); if(dd<bd){bd=dd;bt=t;} } }
-    if(!bt) break;                       // no free tug right now — ship keeps the berth and waits
-    s.state='assigned_out'; s.tug=bt.id; bt.state='to_berth'; bt.ship=s.id;
+    const free = tugs.filter(t=>t.state==='idle' && !t.broken);
+    if(free.length < TUGS_PER_MOVE) break;       // not enough free tugs — ship keeps the berth and waits
+    // same policy as inbound: nearest tugs for "nearest", otherwise at random
+    const chosen = selectTugs(free, s.x, s.y, TUGS_PER_MOVE, rule);
+    s.state='assigned_out'; s.tugs=chosen.map(t=>t.id);
+    chosen.forEach(t=>{ t.state='to_berth'; t.ship=s.id; });
   }
 }
 
@@ -554,27 +579,51 @@ function update(dt){
   for(const t of tugs){
     t.trail.push([t.x,t.y]); if(t.trail.length>14) t.trail.shift();
     if(t.broken>0){ t.broken=Math.max(0,t.broken-dt); continue; }
-    const s = t.ship? ships.find(x=>x.id===t.ship) : null;
-    if(t.state==='to_ship' && s){                       // inbound: go to the ship's queue spot and wait for it
-      const spot = s.slot>=0? QUEUE[s.slot] : [s.x, s.y];
-      const tugThere = tugMove(t, spot[0], spot[1], 95, dt);
-      const shipThere = s.slot<0 || Math.hypot(s.x-spot[0], s.y-spot[1]) < 9;
-      if(tugThere && shipThere){ s.slot=-1; t.state='towing'; s.state='towing'; }   // meet at the spot, then tow
-    } else if(t.state==='towing' && s){                 // inbound: tow it to the berth
-      const b=berths.find(x=>x.id===s.berth);
-      const arrived = tugMove(t, b.x-14, b.y, 62, dt);
-      s.x=t.x+16; s.y=t.y;                              // ship trails the tug
-      if(arrived){ s.x=b.x; s.y=b.y; s.state='berthed'; s.berthStart=simTime; t.state='returning'; t.ship=null; }
-    } else if(t.state==='to_berth' && s){               // outbound: drive to the berthed ship
-      if(tugMove(t, s.x, s.y, 95, dt)){ t.state='towing_out'; s.state='towing_out';
-        const b=berths.find(x=>x.id===s.berth); if(b) b.ship=null; }   // free the berth as we pull it away
-    } else if(t.state==='towing_out' && s){             // outbound: tow it into the departure lane, then release
-      const relX = RELEASE_X - tugs.indexOf(t)*46;      // stagger per tug so tugs don't converge on one point
-      const arrived = tugMove(t, relX, OUT_Y, 58, dt);
-      s.x=t.x+14; s.y=t.y;                              // ship trails the tug
-      if(arrived){ s.state='departing'; s.tug=null; t.state='returning'; t.ship=null; }
-    } else if(t.state==='returning'){
+    if(t.state==='returning'){                          // head home independently
       if(tugMove(t, t.hx, t.hy, 90, dt)) t.state='idle';
+      continue;
+    }
+    const s = t.ship? ships.find(x=>x.id===t.ship) : null;
+    if(!s) continue;                                     // idle with no job
+
+    // this ship's whole convoy — every tug moves, but only the lead drives ship position & transitions
+    const mates = shipTugs(s);
+    const n = mates.length, role = mates.findIndex(m=>m.id===t.id);
+    const lat = tugLateral(role, n), isLead = role===0;
+    const cx = ()=> mates.reduce((a,m)=>a+m.x,0)/n;
+    const cy = ()=> mates.reduce((a,m)=>a+m.y,0)/n;
+    const allAt = (fx,fy,tol)=> mates.every((m,i)=> Math.hypot(m.x-fx, m.y-(fy+tugLateral(i,n))) < tol);
+
+    if(t.state==='to_ship'){                            // inbound: flank the ship at its queue spot
+      const spot = s.slot>=0? QUEUE[s.slot] : [s.x, s.y];
+      tugMove(t, spot[0]-6, spot[1]+lat, 95, dt);
+      if(isLead){
+        const shipThere = s.slot<0 || Math.hypot(s.x-spot[0], s.y-spot[1]) < 9;
+        if(allAt(spot[0]-6, spot[1], 11) && shipThere){ s.slot=-1; s.state='towing'; mates.forEach(m=>m.state='towing'); }
+      }
+    } else if(t.state==='towing'){                      // inbound: tow to the berth together
+      const b=berths.find(x=>x.id===s.berth);
+      tugMove(t, b.x-14, b.y+lat, 62, dt);
+      if(isLead){
+        s.x=cx()+16; s.y=cy();                          // ship rides behind the convoy
+        if(allAt(b.x-14, b.y, 6)){
+          s.x=b.x; s.y=b.y; s.state='berthed'; s.berthStart=simTime;
+          mates.forEach(m=>{ m.state='returning'; m.ship=null; }); s.tugs=[];
+        }
+      }
+    } else if(t.state==='to_berth'){                    // outbound: drive to the berthed ship
+      tugMove(t, s.x-6, s.y+lat, 95, dt);
+      if(isLead && allAt(s.x-6, s.y, 8)){
+        s.state='towing_out'; mates.forEach(m=>m.state='towing_out');
+        const b=berths.find(x=>x.id===s.berth); if(b) b.ship=null;   // free the berth as the convoy pulls it away
+      }
+    } else if(t.state==='towing_out'){                  // outbound: tow into the departure lane, then release
+      const relX = RELEASE_X - (s.num%4)*40;            // stagger convoys so they don't converge on one point
+      tugMove(t, relX, OUT_Y+lat, 58, dt);
+      if(isLead){
+        s.x=cx()+14; s.y=cy();                          // ship trails the convoy
+        if(allAt(relX, OUT_Y, 6)){ s.state='departing'; s.tugs=[]; mates.forEach(m=>{ m.state='returning'; m.ship=null; }); }
+      }
     }
   }
   ships = ships.filter(s=>s.state!=='done');
@@ -592,7 +641,7 @@ function update(dt){
   if(simTime-lastDecision >= DECISION_EVERY){
     lastDecision=simTime;
     const state=buildState();
-    if(state.waitingShips.length && state.berths.length && state.tugs.length){
+    if(state.waitingShips.length && state.berths.length && state.tugs.length>=TUGS_PER_MOVE){
       const res=schedule(state, rule);
       if(res.assignments.length){ applyAssignments(res); logDecision(state,res); }
     }
@@ -640,7 +689,7 @@ function draw(){
   ctx.fillText('CRANE BERTHS', WHARF_X-6, H-14);
 
   // tow lines
-  tugs.forEach(t=>{ if(t.state==='towing'){ const s=ships.find(x=>x.id===t.ship);
+  tugs.forEach(t=>{ if(t.state==='towing'||t.state==='towing_out'){ const s=ships.find(x=>x.id===t.ship);
     if(s){ ctx.strokeStyle='rgba(242,160,61,.6)'; ctx.setLineDash([4,4]); ctx.lineWidth=1.5;
       ctx.beginPath(); ctx.moveTo(t.x,t.y); ctx.lineTo(s.x,s.y); ctx.stroke(); ctx.setLineDash([]); } } });
 
@@ -757,7 +806,7 @@ function logDecision(state,res){
   const box=$('logBox');
   res.assignments.forEach(a=>{
     const d=document.createElement('div');
-    d.innerHTML=`t=${state.time} · <b>${res.rule}</b> → ${a.ship}→${a.berth} via ${a.tug} <span style="color:#5a6b72">(p=${a.score})</span>`;
+    d.innerHTML=`t=${state.time} · <b>${res.rule}</b> → ${a.ship}→${a.berth} via ${(a.tugs||[]).join('+')} <span style="color:#5a6b72">(p=${a.score})</span>`;
     box.prepend(d);
   });
   while(box.children.length>9) box.removeChild(box.lastChild);
@@ -829,19 +878,25 @@ function generateScenario(p){
 
 function newBenchShip(teu, urgent, deadlineAbs){
   ships.push({ id:'S'+(++shipSeq), num:shipSeq, teu, urgent, x:SPAWN[0], y:SPAWN[1]+(shipSeq%5)*7,
-    state:'incoming', slot:-1, berth:null, tug:null, arrival:simTime, berthStart:null,
+    state:'incoming', slot:-1, berth:null, tugs:[], arrival:simTime, berthStart:null,
     deadline:deadlineAbs, moves:Math.max(4,Math.round(teu/22)), done:0 });
 }
 
 function breakATug(dur){
   const t=tugs.find(t=>t.broken<=0);
-  if(t){ t.broken=dur;
-    if(t.ship){ const s=ships.find(x=>x.id===t.ship);
-      if(s){
-        if(s.state==='towing_out'||s.state==='assigned_out'){ s.state='await_out'; s.tug=null; }  // still needs a tug to leave
-        else { s.state='queued'; if(s.berth){ const b=berths.find(b=>b.id===s.berth); if(b) b.ship=null; } s.berth=null; s.tug=null; }
-      }
-      t.ship=null; t.state='idle'; } }
+  if(!t) return;
+  t.broken=dur;
+  const s = t.ship? ships.find(x=>x.id===t.ship) : null;
+  t.ship=null; t.state='idle';                          // broken tug drops its job (broken>0 keeps it out of the pool)
+  if(!s) return;
+  // send the rest of this ship's convoy back to base
+  tugs.forEach(m=>{ if(m!==t && s.tugs && s.tugs.includes(m.id)){ m.ship=null; m.state='returning'; } });
+  s.tugs=[];
+  if(s.state==='towing_out'||s.state==='assigned_out'){ s.state='await_out'; }        // still needs tugs to leave
+  else if(s.state==='towing'||s.state==='assigned'){                                  // revert an inbound move
+    s.state='queued';
+    if(s.berth){ const b=berths.find(b=>b.id===s.berth); if(b) b.ship=null; } s.berth=null;
+  }
 }
 
 function benchControl(){
