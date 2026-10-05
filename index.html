@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dynamic Tug Scheduling — Project A Demo · V_4_0</title>
+<title>Dynamic Tug Scheduling — Project A Demo · V_4_5</title>
 <style>
   :root{
     --ink:#0C2A38;--ink2:#081E28;--panel:#12303d;--panel2:#0f2a36;
@@ -169,8 +169,8 @@
     display:flex;align-items:center;justify-content:center;background:var(--ink2);}
   body.exhibit canvas{width:100%;height:auto;margin:0;border-radius:0;
     max-width:calc(100vh * 940 / 540);max-height:100vh;}
-  body.exhibit .legend{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
-    background:rgba(8,28,37,.62);backdrop-filter:blur(6px);padding:7px 16px;border-radius:20px;margin:0;z-index:7;}
+  body.exhibit .legend{position:absolute;right:12px;bottom:10px;left:auto;transform:none;max-width:60vw;justify-content:flex-end;
+    background:rgba(8,28,37,.62);backdrop-filter:blur(6px);padding:6px 14px;border-radius:20px;margin:0;z-index:7;}
 
   /* floating control overlay — horizontal bar, top-centre (exhibition only) */
   .exh-panel{display:none;}
@@ -179,6 +179,11 @@
     width:auto;max-width:min(94vw,1080px);padding:11px 14px;
     background:rgba(10,32,42,.8);backdrop-filter:blur(10px);
     border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5);}
+  /* auto-hide: controls + legend fade away when idle so the whole stage (tug base, lanes…) stays visible */
+  body.exhibit .exh-panel, body.exhibit .legend{transition:opacity .25s ease, transform .25s ease;}
+  body.exhibit.exh-idle .exh-panel{opacity:0;transform:translate(-50%,-16px);pointer-events:none;}
+  body.exhibit.exh-idle .legend{opacity:0;pointer-events:none;}
+  body.exhibit.exh-idle, body.exhibit.exh-idle canvas{cursor:none;}
   .exh-controls{display:flex;align-items:center;gap:11px;flex-wrap:wrap;justify-content:center;}
   .exh-title{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
     color:var(--cyan);font-weight:600;white-space:nowrap;}
@@ -340,16 +345,20 @@ window.addEventListener('resize', ()=>{
 });
 
 // ---------- layout anchors ----------
+const SHOW_CRANE_RATE = false;   // set true to show each crane's speed (moves/s) beside its berth name
 const WHARF_X = 884;
 const BERTHS_Y = [120, 270, 420];
 const BERTH_SHIP_X = 820;
-const QUEUE = (()=>{ const q=[]; for(const x of [190,120,50]) for(const y of [90,180,270,360,450]) q.push([x,y]); return q; })();
+const QUEUE = (()=>{ const q=[]; for(const x of [190,120,50]) for(const y of [90,180,270,360]) q.push([x,y]); return q; })();
 const TUG_BASE = [430, 48];   // parked along the top, clear of the bottom departure lane
 const NUM_TUGS = 7;         // fleet size
 const TUGS_PER_MOVE = 2;    // tugs required to move a ship in or out
 const SPAWN = [40, 60];
 let selectedShipId = null;   // ship inspected via click
-const RELEASE_X = 600, OUT_Y = 512;   // outbound: tug releases here; ships then depart left along OUT_Y
+const RELEASE_X = 600;                 // outbound: tug releases here; ships then depart left along their lane
+const DEPART_TOP = 400;                // departure zone = freed band below the 4 queue rows (y 400 → bottom)
+const DEPART_LANES = [448, 504];       // two parallel lanes so departing ships/convoys don't share one line
+const laneY = s => DEPART_LANES[(s.num||0) % DEPART_LANES.length];
 
 // ---------- state ----------
 let ships=[], tugs=[], berths=[], simTime=0, running=true, speed=1.5;
@@ -513,16 +522,107 @@ function blockedAhead(self, tx, ty){
   return false;
 }
 // tugs steer away from each other while heading to their target, so convoys never overlap (and can't deadlock)
-function tugMove(t, tx, ty, sp, dt){
+function tugMove(t, tx, ty, sp, dt, noSep){
   let dx=tx-t.x, dy=ty-t.y; const remaining=Math.hypot(dx,dy)||1; dx/=remaining; dy/=remaining;
   let sx=0, sy=0;                                   // separation from nearby tugs
-  for(const o of tugs){ if(o===t || o.broken>0) continue;
+  if(!noSep) for(const o of tugs){ if(o===t || o.broken>0) continue;
+    if(t.ship && o.ship===t.ship) continue;         // never push convoy mates off the ship they share
     const rx=t.x-o.x, ry=t.y-o.y, rd=Math.hypot(rx,ry);
     if(rd>0.1 && rd<46){ const f=(46-rd)/46; sx+=rx/rd*f; sy+=ry/rd*f; } }
   let vx=dx + sx*1.9, vy=dy + sy*1.9; const vd=Math.hypot(vx,vy)||1; vx/=vd; vy/=vd;
   const step=sp*dt;
   if(remaining<=step){ t.x=tx; t.y=ty; return true; }
   t.x+=vx*step; t.y+=vy*step; return false;
+}
+// ---------- tow-convoy traffic control ----------
+// When an inbound tow and an outbound tow would cross, the one that would reach the crossing
+// later stops HOLD_GAP short of the conflict zone, waits until the other has cleared it, then resumes.
+const CLEAR = 70;       // required clearance (px) between two tow paths
+const HOLD_GAP = 45;    // the yielding convoy stops this far before entering the conflict zone
+const YIELD_MAX = 10;   // safety valve: after this many sim-seconds of waiting, go anyway (avoids 3-way deadlock)
+function segDist(px,py,x0,y0,x1,y1){
+  const dx=x1-x0, dy=y1-y0, l2=dx*dx+dy*dy;
+  const u = l2? Math.max(0,Math.min(1,((px-x0)*dx+(py-y0)*dy)/l2)) : 0;
+  return Math.hypot(px-(x0+u*dx), py-(y0+u*dy));
+}
+function convoyPath(s){
+  const ts=shipTugs(s); if(!ts.length) return null;
+  const n=ts.length, x0=ts.reduce((a,m)=>a+m.x,0)/n, y0=ts.reduce((a,m)=>a+m.y,0)/n;
+  let x1,y1;
+  if(s.state==='towing'){ const b=berths.find(q=>q.id===s.berth); if(!b) return null; x1=b.x-14; y1=b.y; }
+  else { x1=RELEASE_X-(s.num%4)*40; y1=laneY(s); }
+  return {x0,y0,x1,y1};
+}
+// distance A must still travel before it comes within CLEAR of B's remaining path (Infinity = no conflict)
+function entryDist(A,B,clear=CLEAR){
+  let bx0=B.x0, by0=B.y0; const bl=Math.hypot(B.x1-B.x0,B.y1-B.y0)||1;
+  bx0 -= (B.x1-B.x0)/bl*30; by0 -= (B.y1-B.y0)/bl*30;     // include the length of B's ship trailing its convoy
+  const al=Math.hypot(A.x1-A.x0,A.y1-A.y0);
+  for(let d=0; d<=al; d+=6){
+    const px=A.x0+(A.x1-A.x0)*(d/(al||1)), py=A.y0+(A.y1-A.y0)*(d/(al||1));
+    if(segDist(px,py,bx0,by0,B.x1,B.y1)<clear) return d;
+  }
+  return Infinity;
+}
+function computeYields(dt){
+  const cs = ships.filter(s=>s.state==='towing'||s.state==='towing_out');
+  const held = new Set(), path = new Map();
+  cs.forEach(s=>{ const p=convoyPath(s); if(p) path.set(s,p); });
+  for(const s of ships){ s.hold=false; if(s.ignoreT>0) s.ignoreT-=dt; if(!path.has(s)) s.yieldTo=null; }
+  for(let i=0;i<cs.length;i++) for(let j=i+1;j<cs.length;j++){
+    const a=cs[i], b=cs[j]; if(!path.has(a)||!path.has(b)) continue;
+    const da=entryDist(path.get(a),path.get(b)), db=entryDist(path.get(b),path.get(a));
+    if(da===Infinity && db===Infinity){                 // paths no longer conflict → release
+      if(a.yieldTo===b.id) a.yieldTo=null; if(b.yieldTo===a.id) b.yieldTo=null; continue; }
+    let y;
+    if(a.yieldTo===b.id) y=a; else if(b.yieldTo===a.id) y=b;   // decision is latched so it can't flip-flop
+    else {
+      if(Math.abs(da-db)<4) y = a.state==='towing' ? a : (b.state==='towing' ? b : (a.num>b.num?a:b));
+      else y = da>db ? a : b;                           // whoever is farther from the crossing gives way
+      y.yieldTo = (y===a?b:a).id;
+    }
+    const dy = y===a ? da : db;
+    if(y.ignoreT>0 || dy===Infinity) continue;
+    if(dy <= HOLD_GAP) held.add(y);
+  }
+  for(const s of cs){
+    if(held.has(s)){ s.holdT=(s.holdT||0)+dt;
+      if(s.holdT>YIELD_MAX){ s.holdT=0; s.ignoreT=4; s.yieldTo=null; } else s.hold=true;
+    } else s.holdT=0;
+  }
+}
+// ---------- free-tug give-way ----------
+// Tugs travelling without a tow (returning to base, heading to a ship to pick it up) give way to moving ships:
+// if their straight path would run into the path of a moving ship, they stop short and wait until it has passed.
+const TUG_CLEAR = 42;      // clearance (px) kept from a moving ship's path
+const TUG_HOLD = 24;       // stop this far before entering that clearance zone
+const TUG_WAIT_MAX = 12;   // safety valve: after this many sim-seconds, go on anyway
+function movingShipPaths(t){
+  const out=[];
+  for(const s of ships){
+    if(s.id===t.ship) continue;                        // the tug's own ship is not an obstacle
+    if(s.state==='towing'||s.state==='towing_out'){ const p=convoyPath(s); if(p) out.push(p); }
+    else if(s.state==='departing') out.push({x0:s.x,y0:s.y,x1:-70,y1:laneY(s)});
+    else if(s.state==='incoming'||(s.state==='assigned'&&s.slot>=0)){
+      const tg = s.slot>=0? QUEUE[s.slot] : [SPAWN[0], 60+((s.num||0)%5)*66];
+      if(Math.hypot(tg[0]-s.x,tg[1]-s.y)>3) out.push({x0:s.x,y0:s.y,x1:tg[0],y1:tg[1]});
+    }
+  }
+  return out;
+}
+function freeTugMove(t, tx, ty, sp, dt){
+  if(t.ignoreT>0) t.ignoreT-=dt;
+  if(!(t.ignoreT>0)){
+    const A={x0:t.x,y0:t.y,x1:tx,y1:ty}; let dmin=Infinity;
+    for(const B of movingShipPaths(t)){ const d=entryDist(A,B,TUG_CLEAR); if(d<dmin) dmin=d; }
+    // dmin===0 means the tug is already alongside the ship's path (e.g. just released) → keep moving away
+    if(dmin>0 && dmin<=TUG_HOLD){
+      t.waitT=(t.waitT||0)+dt;
+      if(t.waitT>TUG_WAIT_MAX){ t.waitT=0; t.ignoreT=4; }
+      else { t.waiting=true; return false; }
+    } else t.waitT=0;
+  }
+  return tugMove(t, tx, ty, sp, dt);
 }
 // dispatch a free tug to unberth any ship that has finished offloading
 function assignOutbound(){
@@ -550,6 +650,7 @@ function update(dt){
   assignQueueSlots();
 
   assignOutbound();
+  computeYields(dt);
 
   // ships
   for(const s of ships){
@@ -558,7 +659,7 @@ function update(dt){
     turnToward(s, dt);
 
     if(s.state==='incoming'){
-      const tgt = s.slot>=0? QUEUE[s.slot] : [SPAWN[0], 60 + ((s.num||0)%7)*66];
+      const tgt = s.slot>=0? QUEUE[s.slot] : [SPAWN[0], 60 + ((s.num||0)%5)*66];
       if(!blockedAhead(s,tgt[0],tgt[1]) && moveToward(s,tgt[0],tgt[1],66,dt) && s.slot>=0) s.state='queued';
     } else if(s.state==='berthed'){
       if(!windHalts()){
@@ -567,7 +668,9 @@ function update(dt){
         if(s.done>=s.moves){ s.state='await_out'; recordServed(s); }   // done offloading; needs a tug to leave, berth stays busy
       }
     } else if(s.state==='departing'){
-      if(!blockedAhead(s,-70,OUT_Y) && moveToward(s,-70,OUT_Y,60,dt)) s.state='done';
+      // wait a moment while a just-released tug is still alongside, so the hull never slides over it
+      const tugClose = tugs.some(t=>t.state==='returning' && t.broken<=0 && Math.hypot(t.x-s.x,t.y-s.y)<30);
+      if(!tugClose && !blockedAhead(s,-70,laneY(s)) && moveToward(s,-70,laneY(s),60,dt)) s.state='done';
     } else if(s.state==='assigned' && s.slot>=0){
       // keep sailing to the assigned queue spot; the tug meets it there
       if(!blockedAhead(s,QUEUE[s.slot][0],QUEUE[s.slot][1])) moveToward(s,QUEUE[s.slot][0],QUEUE[s.slot][1],66,dt);
@@ -577,14 +680,23 @@ function update(dt){
 
   // tugs
   for(const t of tugs){
+    t.waiting=false;
     t.trail.push([t.x,t.y]); if(t.trail.length>14) t.trail.shift();
     if(t.broken>0){ t.broken=Math.max(0,t.broken-dt); continue; }
     if(t.state==='returning'){                          // head home independently
-      if(tugMove(t, t.hx, t.hy, 90, dt)) t.state='idle';
+      // just released next to a departing ship: back off sideways first so the tug never cuts across its hull
+      const dep = ships.find(x=>x.state==='departing' && Math.hypot(t.x-x.x,t.y-x.y)<44);
+      if(dep){
+        const ux=(t.x-dep.x), uy=-(Math.abs(t.y-dep.y)+30), ul=Math.hypot(ux,uy)||1;
+        tugMove(t, t.x+ux/ul*34, t.y+uy/ul*34, 90, dt, true);
+        continue;
+      }
+      if(freeTugMove(t, t.hx, t.hy, 90, dt)) t.state='idle';
       continue;
     }
     const s = t.ship? ships.find(x=>x.id===t.ship) : null;
     if(!s) continue;                                     // idle with no job
+    if(s.hold && (t.state==='towing'||t.state==='towing_out')) continue;   // yielding: whole convoy waits in place
 
     // this ship's whole convoy — every tug moves, but only the lead drives ship position & transitions
     const mates = shipTugs(s);
@@ -596,14 +708,14 @@ function update(dt){
 
     if(t.state==='to_ship'){                            // inbound: flank the ship at its queue spot
       const spot = s.slot>=0? QUEUE[s.slot] : [s.x, s.y];
-      tugMove(t, spot[0]-6, spot[1]+lat, 95, dt);
+      freeTugMove(t, spot[0]-6, spot[1]+lat, 95, dt);
       if(isLead){
         const shipThere = s.slot<0 || Math.hypot(s.x-spot[0], s.y-spot[1]) < 9;
         if(allAt(spot[0]-6, spot[1], 11) && shipThere){ s.slot=-1; s.state='towing'; mates.forEach(m=>m.state='towing'); }
       }
     } else if(t.state==='towing'){                      // inbound: tow to the berth together
       const b=berths.find(x=>x.id===s.berth);
-      tugMove(t, b.x-14, b.y+lat, 62, dt);
+      tugMove(t, b.x-14, b.y+lat, 62, dt, true);
       if(isLead){
         s.x=cx()+16; s.y=cy();                          // ship rides behind the convoy
         if(allAt(b.x-14, b.y, 6)){
@@ -612,17 +724,18 @@ function update(dt){
         }
       }
     } else if(t.state==='to_berth'){                    // outbound: drive to the berthed ship
-      tugMove(t, s.x-6, s.y+lat, 95, dt);
+      freeTugMove(t, s.x-6, s.y+lat, 95, dt);
       if(isLead && allAt(s.x-6, s.y, 8)){
         s.state='towing_out'; mates.forEach(m=>m.state='towing_out');
         const b=berths.find(x=>x.id===s.berth); if(b) b.ship=null;   // free the berth as the convoy pulls it away
       }
     } else if(t.state==='towing_out'){                  // outbound: tow into the departure lane, then release
       const relX = RELEASE_X - (s.num%4)*40;            // stagger convoys so they don't converge on one point
-      tugMove(t, relX, OUT_Y+lat, 58, dt);
+      const outY = laneY(s);
+      tugMove(t, relX, outY+lat, 58, dt, true);
       if(isLead){
         s.x=cx()+14; s.y=cy();                          // ship trails the convoy
-        if(allAt(relX, OUT_Y, 6)){ s.state='departing'; s.tugs=[]; mates.forEach(m=>{ m.state='returning'; m.ship=null; }); }
+        if(allAt(relX, outY, 6)){ s.state='departing'; s.tugs=[]; mates.forEach(m=>{ m.state='returning'; m.ship=null; }); }
       }
     }
   }
@@ -668,7 +781,20 @@ function draw(){
   ctx.strokeStyle='rgba(95,183,217,.25)'; ctx.setLineDash([5,5]);
   QUEUE.forEach(q=>{ rr(q[0]-22,q[1]-11,44,22,6); ctx.stroke(); }); ctx.setLineDash([]);
   ctx.fillStyle='rgba(138,166,174,.5)'; ctx.font='10px ui-monospace,monospace';
-  ctx.fillText('OFFSHORE QUEUE', 40, H-14);
+  ctx.fillText('OFFSHORE QUEUE', 40, DEPART_TOP-12);
+  // departure zone (freed band below the queue)
+  ctx.fillStyle='rgba(242,160,61,.045)'; ctx.fillRect(0, DEPART_TOP, WHARF_X, H-DEPART_TOP);
+  ctx.strokeStyle='rgba(242,160,61,.28)'; ctx.lineWidth=1; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(0,DEPART_TOP); ctx.lineTo(WHARF_X,DEPART_TOP); ctx.stroke();
+  ctx.setLineDash([10,8]); ctx.strokeStyle='rgba(242,160,61,.3)';
+  DEPART_LANES.forEach(y=>{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(WHARF_X-4,y); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle='rgba(242,160,61,.45)';                       // direction chevrons
+    for(let x=90;x<WHARF_X-60;x+=170){ ctx.beginPath(); ctx.moveTo(x+6,y-5); ctx.lineTo(x-2,y); ctx.lineTo(x+6,y+5); ctx.closePath(); ctx.fill(); }
+    ctx.setLineDash([10,8]); });
+  ctx.setLineDash([]);
+  ctx.fillStyle='rgba(242,160,61,.6)'; ctx.font='10px ui-monospace,monospace';
+  ctx.fillText('DEPARTURE LANES  ←  OPEN SEA', 40, H-14);
+  ctx.fillStyle='rgba(138,166,174,.5)';
 
   // wharf
   const halted=windHalts();
@@ -682,11 +808,19 @@ function draw(){
     ctx.strokeStyle=halted?'#F2765D':'#5fd0cf'; ctx.lineWidth=3; ctx.beginPath();
     ctx.moveTo(WHARF_X+14, b.y-34); ctx.lineTo(WHARF_X+14, b.y+34);
     ctx.moveTo(WHARF_X+14, b.y-30); ctx.lineTo(BERTH_SHIP_X-4, b.y-30); ctx.stroke();
-    ctx.fillStyle='#8AA6AE'; ctx.font='9px ui-monospace,monospace';
-    ctx.fillText(b.id+' ·'+b.rate.toFixed(1), WHARF_X+22, b.y+3);
+    // crane label: id + rate stacked and centred on the wharf strip, so nothing is clipped by the canvas edge
+    const lx = (WHARF_X+20+W)/2;
+    ctx.textAlign='center';
+    ctx.fillStyle='#bcd3d9'; ctx.font='bold 10px ui-monospace,monospace';
+    ctx.fillText(b.id, lx, SHOW_CRANE_RATE? b.y-2 : b.y+4);
+    if(SHOW_CRANE_RATE){                                   // crane speed (moves per second) — hidden for now
+      ctx.fillStyle='#eaf3f5'; ctx.font='bold 11px ui-monospace,monospace';
+      ctx.fillText(b.rate.toFixed(1)+'/s', lx, b.y+12);
+    }
+    ctx.textAlign='left';
   });
   ctx.fillStyle='rgba(138,166,174,.55)'; ctx.font='10px ui-monospace,monospace';
-  ctx.fillText('CRANE BERTHS', WHARF_X-6, H-14);
+  ctx.textAlign='right'; ctx.fillText('CRANE BERTHS', W-8, H-14); ctx.textAlign='left';
 
   // tow lines
   tugs.forEach(t=>{ if(t.state==='towing'||t.state==='towing_out'){ const s=ships.find(x=>x.id===t.ship);
@@ -729,6 +863,7 @@ function draw(){
     if(berthed){ const p=Math.min(1,s.done/s.moves);                                     // offload progress
       ctx.strokeStyle='#7de0a0'; ctx.lineWidth=2.5; ctx.beginPath();
       ctx.arc(0,-(hw+11),7,-Math.PI/2,-Math.PI/2+p*2*Math.PI); ctx.stroke(); }
+    if(s.hold){ ctx.fillStyle='rgba(242,160,61,.9)'; ctx.font='bold 8px ui-monospace,monospace'; ctx.textAlign='center'; ctx.fillText('YIELD',0,hw+12); }
     if(s.urgent){ ctx.fillStyle='#F2765D'; ctx.beginPath(); ctx.arc(half-3,-hw-5,5,0,7); ctx.fill();
       ctx.fillStyle='#2a1600'; ctx.font='bold 8px ui-monospace,monospace'; ctx.textAlign='center'; ctx.fillText('!',half-3,-hw-2.3); }
     if(s.state==='queued' && s.deadline-simTime<10){ ctx.fillStyle='#F2765D'; ctx.beginPath(); ctx.arc(-half+3,-hw-4,3.2,0,7); ctx.fill(); }
@@ -760,6 +895,8 @@ function draw(){
     ctx.fillStyle = t.broken>0? '#F2765D' : '#dbe8ec';
     ctx.beginPath(); ctx.arc(-1.2,0,1.5,0,7); ctx.fill();
     ctx.restore();
+    if(t.waiting){ ctx.fillStyle='rgba(242,160,61,.9)'; ctx.font='bold 8px ui-monospace,monospace';
+      ctx.textAlign='center'; ctx.fillText('WAIT',t.x,t.y-11); ctx.textAlign='left'; }
     if(t.broken>0){ ctx.fillStyle='#F2765D'; ctx.font='bold 10px ui-monospace,monospace';
       ctx.textAlign='center'; ctx.fillText('✕',t.x,t.y-11); ctx.textAlign='left'; }
   });
@@ -1047,16 +1184,32 @@ function syncExhibit(){
   t.style.display = onScen ? '' : 'none';
 }
 
+// auto-hide the floating controls: shown on any mouse move / touch / key, hidden after a few idle seconds
+const EXH_IDLE_MS = 2000;
+let exhIdleTimer = 0;
+function exhWake(){
+  if(!document.body.classList.contains('exhibit')) return;
+  document.body.classList.remove('exh-idle');
+  clearTimeout(exhIdleTimer);
+  exhIdleTimer = setTimeout(()=>{
+    if($('exhPanel').matches(':hover')) exhWake();          // pointer resting on the panel → keep it
+    else document.body.classList.add('exh-idle');
+  }, EXH_IDLE_MS);
+}
+['mousemove','mousedown','touchstart','keydown'].forEach(ev=> document.addEventListener(ev, exhWake, {passive:true}));
+
 function enterExhibit(){
   $('benchOverlay').classList.remove('on');
   if(!bench.active){ running=true; $('playBtn').textContent='Pause'; }
   document.body.classList.add('exhibit');
   syncExhibit();
+  exhWake();
   try{ if(!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{}); }catch(e){}
   requestAnimationFrame(fitCanvas);
 }
 function exitExhibit(){
-  document.body.classList.remove('exhibit');
+  clearTimeout(exhIdleTimer);
+  document.body.classList.remove('exhibit','exh-idle');
   try{ if(document.fullscreenElement) document.exitFullscreen().catch(()=>{}); }catch(e){}
   requestAnimationFrame(fitCanvas);
 }

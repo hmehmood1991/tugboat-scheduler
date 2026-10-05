@@ -26,9 +26,10 @@ The port is laid out left to right on a fixed 940 × 540 logical canvas:
 
 | Element | Count | Behaviour |
 |---|---|---|
-| **Offshore queue** | 15 slots | Arriving ships sail to a free holding slot and wait for a tug. |
+| **Offshore queue** | 12 slots (3 columns × 4 rows) | Arriving ships sail to a free holding slot and wait for a tug. |
 | **Tugs** | 7 (T1–T7) | Park at the tug base along the top of the harbour. Every ship movement needs a **two-tug convoy**: the pair flanks the ship at its queue slot, tows it to a berth, and later a pair returns to unberth it and tow it to the departure lane. |
-| **Crane berths** | 3 (B1–B3) | Each has a different crane rate (2.2, 2.7 and 3.2 moves/s). A berth stays occupied until a tug has pulled the finished ship away. |
+| **Departure lanes** | 2 | The band below the queue. Outbound convoys release ships onto one of two parallel lanes, and the ships then sail out to sea. |
+| **Crane berths** | 3 (B1–B3) | Each has a different crane rate (2.2, 2.7 and 3.2 moves/s; the rate label is hidden by default, see *Customising*). A berth stays occupied until a tug has pulled the finished ship away. |
 | **Ships** | variable | Carry 120–280 TEU, are *normal* or *urgent* (~25 %), and have a due time by which they should be berthed. |
 
 Each ship moves through a state machine:
@@ -116,7 +117,7 @@ The sidebar tracks, per rule: ships served, average wait (arrival to berth), on-
 | Traffic level | Light, Moderate, Busy, Heavy, Storm arrival rates |
 | Wind slider | Set base wind; above 0.62 the cranes stop |
 | Click a ship | Show its ID, priority, arrival and due time |
-| ⛶ Exhibition mode | Full-screen kiosk view with a compact rule bar and a one-click Storm benchmark (Esc to exit) |
+| ⛶ Exhibition mode | Full-screen kiosk view with a compact rule bar and a one-click Storm benchmark (Esc to exit). The rule bar and legend fade out after 2 s without input so the whole harbour stays visible; move the mouse, tap or press a key to bring them back |
 
 ---
 
@@ -125,17 +126,22 @@ The sidebar tracks, per rule: ships served, average wait (arrival to berth), on-
 | Technology | How it is used |
 |---|---|
 | **HTML5** | Page structure: the canvas stage, sidebar cards, KPI grid, comparison table, benchmark overlay and exhibition panel. |
-| **CSS3** | All styling is inline in a `<style>` block. Custom properties (`--cyan`, `--amber`, `--panel` …) define the colour theme; CSS Grid lays out the stage/sidebar and KPI tiles; Flexbox handles button rows; `clamp()` and a viewport-based `max-width` keep the canvas sized to the screen; a `body.exhibit` class switches the layout into kiosk mode. |
+| **CSS3** | All styling is inline in a `<style>` block. Custom properties (`--cyan`, `--amber`, `--panel` …) define the colour theme; CSS Grid lays out the stage/sidebar and KPI tiles; Flexbox handles button rows; `clamp()` and a viewport-based `max-width` keep the canvas sized to the screen; a `body.exhibit` class switches the layout into kiosk mode, and `body.exhibit.exh-idle` fades the floating controls out. |
 | **Canvas 2D API** | Draws every frame: the water grid, dashed queue slots, the wharf and cranes, rotating top-down ship and tug silhouettes built from paths and quadratic curves, tow lines, tug wake trails, offload progress rings and the wind gauge. The backing store is rescaled to `devicePixelRatio` so it stays sharp on high-DPI displays. |
 | **Vanilla JavaScript (ES6+, strict mode)** | The entire engine — state, scheduler, physics, benchmark harness and UI wiring — with no frameworks or libraries. |
 | **`requestAnimationFrame`** | Drives the main loop. Free-play mode advances by real elapsed time × speed; benchmark mode runs eight fixed 0.045 s sub-steps per frame so runs are fast and deterministic in step size. |
 | **Seeded PRNG (mulberry32)** | Generates reproducible benchmark arrival streams so every rule faces exactly the same ships. |
 | **Fullscreen API** | Used by exhibition mode to take the demo full-screen for displays and kiosks. |
-| **DOM events** | Click handling on the canvas (hit-testing ships by converting screen to world coordinates), button and slider listeners, and the Esc key. |
+| **DOM events** | Click handling on the canvas (hit-testing ships by converting screen to world coordinates), button and slider listeners, the Esc key, and mouse/touch/key activity that wakes the auto-hiding exhibition controls. |
 
 ### Simulation techniques
 
-Movement uses simple kinematic steering: `moveToward()` advances an object along the straight line to its target at a fixed speed. Tugs use `tugMove()`, which adds a **separation force** from nearby tugs so convoys never overlap or deadlock. Ships use `blockedAhead()` for lightweight collision avoidance, pausing only when another *moving* ship is directly in front, and `turnToward()` to rotate smoothly between bow-in and bow-out headings. Convoy tugs are spread laterally by `tugLateral()` so the pair sits either side of the ship; the **lead tug** drives the ship's position (the ship rides at the convoy's centre) and triggers state changes only once every tug in the convoy has reached its mark. Convoys release ships at staggered points in the departure lane so they don't converge on one spot, and returning tugs head home independently.
+Movement uses simple kinematic steering: `moveToward()` advances an object along the straight line to its target at a fixed speed. Tugs use `tugMove()`, which adds a **separation force** from nearby tugs so convoys never overlap or deadlock. Ships use `blockedAhead()` for lightweight collision avoidance, pausing only when another *moving* ship is directly in front, and `turnToward()` to rotate smoothly between bow-in and bow-out headings. Convoy tugs are spread laterally by `tugLateral()` so the pair sits either side of the ship; the **lead tug** drives the ship's position (the ship rides at the convoy's centre) and triggers state changes only once every tug in the convoy has reached its mark. Convoys release ships at staggered points on one of two departure lanes (chosen per ship by `laneY()`) so they don't converge on one spot, and returning tugs head home independently.
+
+**Traffic control (v4.5).** Paths that would otherwise cross are resolved by giving way rather than by steering around each other:
+
+- **Convoy yielding.** `computeYields()` compares the remaining paths of every inbound and outbound tow (`convoyPath()`, `entryDist()`). If two would come within `CLEAR` (70 px) of each other, the convoy that is farther from the crossing stops `HOLD_GAP` (45 px) short of the conflict zone, shows a *YIELD* label, and resumes once the other has cleared it. The decision is latched so it cannot flip-flop, and a `YIELD_MAX` (10 s) timeout prevents three-way deadlocks. While towing, tugs move in straight lines and ignore separation forces, so they stay attached to their ship.
+- **Free-tug give-way.** `freeTugMove()` makes tugs that are travelling without a tow (returning to base or heading to pick up a ship) wait, shown by a *WAIT* label, when their path would run into a moving ship (`movingShipPaths()`). A tug that has just released a ship on the departure lane backs off sideways first, and the departing ship holds until it is clear. A `TUG_WAIT_MAX` (12 s) timeout keeps tugs from waiting forever.
 
 ---
 
@@ -153,15 +159,16 @@ tugboat-scheduler/
 
 | Section | Key functions / objects |
 |---|---|
-| Layout anchors | `WHARF_X`, `BERTHS_Y`, `QUEUE`, `TUG_BASE`, `SPAWN` |
+| Layout anchors | `WHARF_X`, `BERTHS_Y`, `QUEUE`, `TUG_BASE`, `SPAWN`, `RELEASE_X`, `DEPART_TOP`, `DEPART_LANES` |
 | State & config | `NUM_TUGS`, `TUGS_PER_MOVE`, `TRAFFIC`, `GP`, `DECISION_EVERY`, `RULES`, `FORMULAS` |
 | World setup | `init()`, `spawnShip()` |
 | Scheduler API | `buildState()`, `schedule()`, `selectTugs()`, `applyAssignments()`, `assignOutbound()` |
-| Movement | `moveToward()`, `tugMove()`, `shipTugs()`, `tugLateral()`, `blockedAhead()`, `turnToward()`, `update()` |
+| Movement | `moveToward()`, `tugMove()`, `shipTugs()`, `tugLateral()`, `blockedAhead()`, `turnToward()`, `laneY()`, `update()` |
+| Traffic control | `computeYields()`, `convoyPath()`, `entryDist()`, `segDist()`, `freeTugMove()`, `movingShipPaths()` |
 | Rendering | `draw()`, `rr()` |
 | UI panels | `updatePanels()`, `updateShipInfo()` |
 | Benchmark | `SCENARIOS`, `WIND`, `generateScenario()`, `startBenchmark()`, `renderResults()` |
-| Main loop & events | `frame()`, `activateRule()`, exhibition mode handlers |
+| Main loop & events | `frame()`, `activateRule()`, exhibition mode handlers (`enterExhibit()`, `exitExhibit()`, `exhWake()`) |
 
 ---
 
@@ -173,7 +180,11 @@ Most behaviour is controlled by constants near the top of the script:
 - **Scheduler tuning:** edit the `GP` object to change the evolved rule's coefficients.
 - **Decision frequency:** `DECISION_EVERY` (default 1.1 sim-seconds).
 - **Traffic presets:** `TRAFFIC` sets the mean arrival gap and on-screen cap per level.
-- **Berth crane rates:** the `rate` array in `init()`.
+- **Berth crane rates:** the `rate` array in `init()`. Set `SHOW_CRANE_RATE = true` to draw each crane's speed (moves/s) beside its berth name.
+- **Departure lanes:** `DEPART_LANES` (y positions of the lanes) and `DEPART_TOP` (top of the departure zone).
+- **Convoy traffic control:** `CLEAR`, `HOLD_GAP` and `YIELD_MAX` control how much room crossing tows keep, how far short the yielding convoy stops, and how long it waits before going anyway.
+- **Free-tug give-way:** `TUG_CLEAR`, `TUG_HOLD` and `TUG_WAIT_MAX` do the same for tugs travelling without a tow. Smaller values mean less waiting but tighter passes.
+- **Exhibition auto-hide:** `EXH_IDLE_MS` (default 2000 ms) sets how long the floating controls stay visible without input.
 - **Benchmark scenarios:** add or edit entries in `SCENARIOS` and wind profiles in `WIND`.
 - **Adding a rule:** add a key to `RULES`, `RULE_NAMES` and `FORMULAS`, add a scoring branch in `schedule()`, and add matching buttons to the scheduler and exhibition panels.
 
@@ -181,4 +192,4 @@ Most behaviour is controlled by constants near the top of the script:
 
 ## Version
 
-Current version: **4.0** · see [CHANGELOG.md](CHANGELOG.md) for the full version history.
+Current version: **4.5** · see [CHANGELOG.md](CHANGELOG.md) for the full version history.
